@@ -1,0 +1,23 @@
+[project]
+name = "ais-noaa-fetch"
+version = "0.1.0"
+description = "Download AIS vessel tracking data from NOAA and convert to Parquet"
+readme = "README.md"
+authors = [
+    { name = "James Thompson", email = "james@jamtho.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "h3>=4.4.2",
+    "pyarrow>=23.0.0",
+    "requests>=2.32.5",
+    "tqdm>=4.67.3",
+    "zstandard>=0.25.0",
+]
+
+[project.scripts]
+ais-noaa-fetch = "ais_noaa_fetch.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
