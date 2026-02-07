@@ -260,6 +260,9 @@ def convert_file(
 
     table = _read_csv_bytes(csv_bytes)
 
+    # Sort by mmsi then timestamp for fast seeking by vessel
+    table = table.sort_by([("mmsi", "ascending"), ("timestamp", "ascending")])
+
     # Attach GeoParquet metadata to schema
     existing_meta = table.schema.metadata or {}
     existing_meta[b"geo"] = json.dumps(_GEO_METADATA).encode()
