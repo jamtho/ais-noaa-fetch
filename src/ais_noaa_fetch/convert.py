@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import re
@@ -10,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 import h3
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv as pcsv
@@ -178,6 +180,210 @@ def _normalize_columns(table: pa.Table) -> pa.Table:
     return table.rename_columns(new_names)
 
 
+_EARTH_RADIUS_M = 6_371_000.0
+
+
+def _haversine_m(
+    lat1: np.ndarray,
+    lon1: np.ndarray,
+    lat2: np.ndarray,
+    lon2: np.ndarray,
+) -> np.ndarray:
+    """Vectorized haversine distance in metres between consecutive points."""
+    lat1, lon1, lat2, lon2 = (np.radians(a) for a in (lat1, lon1, lat2, lon2))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return 2 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
+
+
+# Index schema for the per-MMSI daily summary
+_INDEX_SCHEMA = pa.schema([
+    ("mmsi", pa.string()),
+    ("date", pa.date32()),
+    # Identity & metadata
+    ("vessel_names", pa.list_(pa.string())),
+    ("imos", pa.list_(pa.string())),
+    ("call_signs", pa.list_(pa.string())),
+    ("vessel_types", pa.list_(pa.int32())),
+    ("cargos", pa.list_(pa.int32())),
+    ("lengths", pa.list_(pa.float64())),
+    ("widths", pa.list_(pa.float64())),
+    ("drafts", pa.list_(pa.float64())),
+    ("transceiver_classes", pa.list_(pa.string())),
+    # Message stats
+    ("message_count", pa.int64()),
+    ("first_timestamp", pa.timestamp("us", tz="UTC")),
+    ("last_timestamp", pa.timestamp("us", tz="UTC")),
+    ("duration_s", pa.float64()),
+    # Geospatial
+    ("centroid_lat", pa.float64()),
+    ("centroid_lon", pa.float64()),
+    ("min_lat", pa.float64()),
+    ("max_lat", pa.float64()),
+    ("min_lon", pa.float64()),
+    ("max_lon", pa.float64()),
+    ("distance_m", pa.float64()),
+    ("h3_cell_count", pa.int64()),
+    # Navigation
+    ("sog_min", pa.float64()),
+    ("sog_max", pa.float64()),
+    ("sog_mean", pa.float64()),
+    ("max_inter_msg_speed_ms", pa.float64()),
+    ("status_codes", pa.list_(pa.int32())),
+])
+
+
+def _build_index(table: pa.Table, date_str: str) -> pa.Table:
+    """Build a per-MMSI daily index/summary from a sorted position table.
+
+    ``table`` must already be sorted by (mmsi, timestamp).
+    """
+    date_val = datetime.date.fromisoformat(date_str)
+
+    # Extract columns as numpy / python arrays for fast iteration
+    mmsi_arr = table.column("mmsi").to_pylist()
+    lat_np = table.column("latitude").to_numpy(zero_copy_only=False)
+    lon_np = table.column("longitude").to_numpy(zero_copy_only=False)
+    sog_np = table.column("sog").to_numpy(zero_copy_only=False)
+    h3_arr = table.column("h3_res15").to_pylist()
+    vname_arr = table.column("vessel_name").to_pylist()
+    imo_arr = table.column("imo").to_pylist()
+    csign_arr = table.column("call_sign").to_pylist()
+    vtype_arr = table.column("vessel_type").to_pylist()
+    status_arr = table.column("status").to_pylist()
+    cargo_arr = table.column("cargo").to_pylist()
+    length_arr = table.column("length").to_pylist()
+    width_arr = table.column("width").to_pylist()
+    draft_arr = table.column("draft").to_pylist()
+    trans_arr = table.column("transceiver").to_pylist()
+
+    # Timestamps as int64 microseconds (avoids tzdata dependency on Windows)
+    ts_us = table.column("timestamp").to_numpy(zero_copy_only=False).astype("int64")
+
+    # Pre-compute haversine distances between consecutive rows
+    dists = np.empty(len(lat_np), dtype=np.float64)
+    dists[0] = 0.0
+    if len(lat_np) > 1:
+        dists[1:] = _haversine_m(lat_np[:-1], lon_np[:-1], lat_np[1:], lon_np[1:])
+
+    # Pre-compute time deltas (seconds) between consecutive rows
+    td_s = np.empty(len(ts_us), dtype=np.float64)
+    td_s[0] = 0.0
+    if len(ts_us) > 1:
+        td_s[1:] = (ts_us[1:] - ts_us[:-1]) / 1_000_000.0  # microseconds -> seconds
+
+    n = len(mmsi_arr)
+
+    # Output accumulators — one list per column
+    out: dict[str, list] = {field.name: [] for field in _INDEX_SCHEMA}
+
+    def _emit(start: int, end: int) -> None:
+        """Emit one index row for rows [start, end)."""
+        out["mmsi"].append(mmsi_arr[start])
+        out["date"].append(date_val)
+
+        # Distinct value sets — identity/metadata
+        def _distinct_str(arr: list, s: int, e: int) -> list[str]:
+            return sorted({v for v in arr[s:e] if v is not None})
+
+        def _distinct_int(arr: list, s: int, e: int) -> list[int]:
+            return sorted({v for v in arr[s:e] if v is not None})
+
+        def _distinct_float(arr: list, s: int, e: int) -> list[float]:
+            vals = {v for v in arr[s:e] if v is not None}
+            return sorted(vals)
+
+        out["vessel_names"].append(_distinct_str(vname_arr, start, end))
+        out["imos"].append(_distinct_str(imo_arr, start, end))
+        out["call_signs"].append(_distinct_str(csign_arr, start, end))
+        out["vessel_types"].append(_distinct_int(vtype_arr, start, end))
+        out["cargos"].append(_distinct_int(cargo_arr, start, end))
+        out["lengths"].append(_distinct_float(length_arr, start, end))
+        out["widths"].append(_distinct_float(width_arr, start, end))
+        out["drafts"].append(_distinct_float(draft_arr, start, end))
+        out["transceiver_classes"].append(_distinct_str(trans_arr, start, end))
+
+        # Message stats
+        count = end - start
+        out["message_count"].append(count)
+        first_us = int(ts_us[start])
+        last_us = int(ts_us[end - 1])
+        out["first_timestamp"].append(first_us)
+        out["last_timestamp"].append(last_us)
+        out["duration_s"].append((last_us - first_us) / 1_000_000.0)
+
+        # Geospatial
+        slat = lat_np[start:end]
+        slon = lon_np[start:end]
+        valid_lat = slat[~np.isnan(slat)]
+        valid_lon = slon[~np.isnan(slon)]
+        out["centroid_lat"].append(float(np.mean(valid_lat)) if len(valid_lat) else None)
+        out["centroid_lon"].append(float(np.mean(valid_lon)) if len(valid_lon) else None)
+        out["min_lat"].append(float(np.min(valid_lat)) if len(valid_lat) else None)
+        out["max_lat"].append(float(np.max(valid_lat)) if len(valid_lat) else None)
+        out["min_lon"].append(float(np.min(valid_lon)) if len(valid_lon) else None)
+        out["max_lon"].append(float(np.max(valid_lon)) if len(valid_lon) else None)
+
+        # Distance — sum haversine for consecutive points within this MMSI
+        # The first row of each group has dist=0 (computed globally, but the
+        # first row of a new MMSI's segment should not use the previous MMSI's
+        # last point). We zeroed dists[0] globally; for subsequent groups the
+        # cross-boundary dist is wrong, so we exclude it.
+        group_dists = dists[start:end].copy()
+        group_dists[0] = 0.0  # first row has no predecessor in this group
+        # Mask out NaN distances (from NaN lat/lon)
+        valid_d = group_dists[~np.isnan(group_dists)]
+        out["distance_m"].append(float(np.sum(valid_d)))
+
+        # H3 cell count
+        h3_set = {v for v in h3_arr[start:end] if v is not None}
+        out["h3_cell_count"].append(len(h3_set))
+
+        # Navigation
+        ssog = sog_np[start:end]
+        valid_sog = ssog[~np.isnan(ssog)]
+        out["sog_min"].append(float(np.min(valid_sog)) if len(valid_sog) else None)
+        out["sog_max"].append(float(np.max(valid_sog)) if len(valid_sog) else None)
+        out["sog_mean"].append(float(np.mean(valid_sog)) if len(valid_sog) else None)
+
+        # Max inter-message speed (m/s)
+        if count >= 2:
+            group_td = td_s[start:end].copy()
+            group_td[0] = 0.0
+            group_d = dists[start:end].copy()
+            group_d[0] = 0.0
+            # Only where time delta > 0 to avoid division by zero
+            mask = group_td > 0
+            if np.any(mask):
+                speeds = group_d[mask] / group_td[mask]
+                valid_speeds = speeds[~np.isnan(speeds)]
+                out["max_inter_msg_speed_ms"].append(
+                    float(np.max(valid_speeds)) if len(valid_speeds) else None
+                )
+            else:
+                out["max_inter_msg_speed_ms"].append(None)
+        else:
+            out["max_inter_msg_speed_ms"].append(None)
+
+        out["status_codes"].append(_distinct_int(status_arr, start, end))
+
+    # Stream through sorted rows, emit when MMSI changes
+    if n > 0:
+        group_start = 0
+        cur_mmsi = mmsi_arr[0]
+        for i in range(1, n):
+            if mmsi_arr[i] != cur_mmsi:
+                _emit(group_start, i)
+                group_start = i
+                cur_mmsi = mmsi_arr[i]
+        _emit(group_start, n)
+
+    # Build the index table
+    arrays = [pa.array(out[field.name], type=field.type) for field in _INDEX_SCHEMA]
+    return pa.table(arrays, schema=_INDEX_SCHEMA)
+
+
 def _read_csv_bytes(data: bytes) -> pa.Table:
     """Read CSV bytes into a PyArrow table with normalized column names."""
     parse_options = pcsv.ParseOptions(delimiter=",")
@@ -234,19 +440,23 @@ def convert_file(
     raw_path: Path,
     data_dir: Path,
     delete_raw: bool = False,
-) -> Path:
+) -> tuple[Path, Path]:
     """Convert a single raw AIS file to Parquet.
 
-    Returns the path to the output Parquet file.
+    Returns (main_parquet_path, index_parquet_path).
     """
     # Determine year from parent directory name
     year = raw_path.parent.name
+    date_str = _extract_date(raw_path.name)
 
-    parquet_dir = data_dir / "parquet" / year
-    parquet_dir.mkdir(parents=True, exist_ok=True)
+    broadcasts_dir = data_dir / "parquet" / "broadcasts" / year
+    index_dir = data_dir / "parquet" / "index" / year
+    broadcasts_dir.mkdir(parents=True, exist_ok=True)
+    index_dir.mkdir(parents=True, exist_ok=True)
 
     # Normalize output filename to ais-YYYY-MM-DD.parquet
-    out_path = parquet_dir / f"ais-{_extract_date(raw_path.name)}.parquet"
+    out_path = broadcasts_dir / f"ais-{date_str}.parquet"
+    index_path = index_dir / f"ais-{date_str}.parquet"
 
     # Decompress
     if raw_path.suffix == ".zst":
@@ -263,27 +473,35 @@ def convert_file(
     # Sort by mmsi then timestamp for fast seeking by vessel
     table = table.sort_by([("mmsi", "ascending"), ("timestamp", "ascending")])
 
+    # Build per-MMSI daily index
+    index_table = _build_index(table, date_str)
+
     # Attach GeoParquet metadata to schema
     existing_meta = table.schema.metadata or {}
     existing_meta[b"geo"] = json.dumps(_GEO_METADATA).encode()
     table = table.replace_schema_metadata(existing_meta)
 
     pq.write_table(table, out_path, compression="zstd")
+    pq.write_table(index_table, index_path, compression="zstd")
 
     if delete_raw:
         raw_path.unlink()
         print(f"Deleted {raw_path.name}")
 
     print(f"Wrote {out_path} ({table.num_rows:,} rows)")
-    return out_path
+    print(f"Wrote {index_path} ({index_table.num_rows:,} MMSIs)")
+    return out_path, index_path
 
 
 def convert_year(
     year: int,
     data_dir: Path,
     delete_raw: bool = False,
-) -> list[Path]:
-    """Convert all raw files for a given year to Parquet."""
+) -> list[tuple[Path, Path]]:
+    """Convert all raw files for a given year to Parquet.
+
+    Returns a list of (main_parquet_path, index_parquet_path) tuples.
+    """
     raw_dir = data_dir / "raw" / str(year)
     if not raw_dir.exists():
         print(f"No raw data directory found: {raw_dir}")
@@ -298,7 +516,7 @@ def convert_year(
         print(f"No raw files found in {raw_dir}")
         return []
 
-    converted: list[Path] = []
+    converted: list[tuple[Path, Path]] = []
     for raw_path in raw_files:
         try:
             out = convert_file(raw_path, data_dir, delete_raw=delete_raw)
