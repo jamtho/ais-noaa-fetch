@@ -155,3 +155,7 @@ gdf = gpd.read_parquet("data/parquet/broadcasts/2025/ais-2025-01-01.parquet")
 
 - **2025+**: `.csv.zst` format
 - **2015–2024**: `.zip` format
+
+## License
+
+[MPL-2.0](LICENSE) — Copyright (c) 2026 James Thompson
