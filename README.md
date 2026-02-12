@@ -43,13 +43,24 @@ uv run ais-noaa-fetch convert --year 2024
 
 ```
 data/
-├── raw/{year}/        # Downloaded .zip or .csv.zst files
-└── parquet/{year}/    # Converted .parquet files
+├── raw/{year}/                    # Downloaded .zip or .csv.zst files
+└── parquet/
+    ├── broadcasts/{year}/         # Full AIS broadcast data
+    │   └── ais-YYYY-MM-DD.parquet
+    └── index/{year}/              # Per-MMSI daily summaries
+        └── ais-YYYY-MM-DD.parquet
 ```
 
-## Parquet schema
+Separate folder trees make it easy to load with DuckDB wildcards:
 
-Each output file contains 20 columns — 17 from the raw NOAA data plus 3 derived columns.
+```sql
+SELECT * FROM read_parquet('data/parquet/broadcasts/**/*.parquet');
+SELECT * FROM read_parquet('data/parquet/index/**/*.parquet');
+```
+
+## Broadcast schema
+
+Each broadcast file contains 20 columns — 17 from the raw NOAA data plus 3 derived columns. Sorted by (mmsi, timestamp).
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -74,22 +85,70 @@ Each output file contains 20 columns — 17 from the raw NOAA data plus 3 derive
 | **`geometry`** | **binary (WKB)** | **Derived — WKB POINT from lon/lat** |
 | **`h3_res15`** | **uint64** | **Derived — H3 cell index at resolution 15** |
 
+## Index schema
+
+One row per MMSI per day. Enables fast lookups and filtering without scanning the full broadcast files.
+
+### Identity & metadata
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `mmsi` | string | Group key |
+| `date` | date32 | File date |
+| `vessel_names` | list\<string\> | Distinct non-null values observed |
+| `imos` | list\<string\> | Distinct non-null values observed |
+| `call_signs` | list\<string\> | Distinct non-null values observed |
+| `vessel_types` | list\<int32\> | Distinct non-null values observed |
+| `cargos` | list\<int32\> | Distinct non-null values observed |
+| `lengths` | list\<float64\> | Distinct non-null values observed |
+| `widths` | list\<float64\> | Distinct non-null values observed |
+| `drafts` | list\<float64\> | Distinct non-null values observed |
+| `transceiver_classes` | list\<string\> | Distinct non-null values observed |
+
+### Message stats
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `message_count` | int64 | Total broadcasts |
+| `first_timestamp` | timestamp(us, UTC) | Earliest broadcast |
+| `last_timestamp` | timestamp(us, UTC) | Latest broadcast |
+| `duration_s` | float64 | Last − first in seconds |
+
+### Geospatial
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `centroid_lat` | float64 | Mean latitude |
+| `centroid_lon` | float64 | Mean longitude |
+| `min_lat` / `max_lat` | float64 | Latitude bounding box |
+| `min_lon` / `max_lon` | float64 | Longitude bounding box |
+| `distance_m` | float64 | Sum of haversine distances between consecutive broadcasts (metres) |
+| `h3_cell_count` | int64 | Distinct H3 res-15 cells visited |
+
+### Navigation
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `sog_min` / `sog_max` / `sog_mean` | float64 | Speed Over Ground stats |
+| `max_inter_msg_speed_ms` | float64 | Max haversine distance / time delta between consecutive broadcasts (m/s) |
+| `status_codes` | list\<int32\> | Distinct navigation status codes observed |
+
 ## GeoParquet
 
-Output files are [GeoParquet 1.1.0](https://geoparquet.org/) compliant — WKB-encoded Point geometries in EPSG:4326 (WGS 84), zstd compressed.
+Broadcast files are [GeoParquet 1.1.0](https://geoparquet.org/) compliant — WKB-encoded Point geometries in EPSG:4326 (WGS 84), zstd compressed.
 
 Works natively with DuckDB Spatial and GeoPandas:
 
 ```sql
 -- DuckDB
 LOAD spatial;
-SELECT * FROM 'data/parquet/2025/ais-2025-01-01.parquet' LIMIT 10;
+SELECT * FROM 'data/parquet/broadcasts/2025/ais-2025-01-01.parquet' LIMIT 10;
 ```
 
 ```python
 # GeoPandas
 import geopandas as gpd
-gdf = gpd.read_parquet("data/parquet/2025/ais-2025-01-01.parquet")
+gdf = gpd.read_parquet("data/parquet/broadcasts/2025/ais-2025-01-01.parquet")
 ```
 
 ## Supported years
