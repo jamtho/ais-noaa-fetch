@@ -60,11 +60,12 @@ SELECT * FROM read_parquet('data/parquet/index/**/*.parquet');
 
 ## Broadcast schema
 
-Each broadcast file contains 20 columns — 17 from the raw NOAA data plus 3 derived columns. Sorted by (mmsi, timestamp).
+Each broadcast file contains 21 columns — 17 from the raw NOAA data plus 4 derived columns. Sorted by (mmsi, timestamp).
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `mmsi` | string | Maritime Mobile Service Identity |
+| **`date`** | **date32** | **Derived — file date** |
 | `base_date_time` | string | Original timestamp string |
 | `latitude` | float64 | Latitude |
 | `longitude` | float64 | Longitude |

@@ -476,6 +476,16 @@ def convert_file(
 
     table = _read_csv_bytes(csv_bytes)
 
+    # Add file date column
+    date_val = datetime.date.fromisoformat(date_str)
+    date_col = pa.array([date_val] * table.num_rows, type=pa.date32())
+    table = table.append_column("date", date_col)
+    # Reorder so date comes right after mmsi
+    cols = list(table.column_names)
+    cols.remove("date")
+    cols.insert(1, "date")
+    table = table.select(cols)
+
     # Sort by mmsi then timestamp for fast seeking by vessel
     table = table.sort_by([("mmsi", "ascending"), ("timestamp", "ascending")])
 
