@@ -14,9 +14,10 @@ import json
 import re
 import struct
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import h3
+from h3.api import numpy_int as h3_np
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -140,22 +141,24 @@ def _add_derived_columns(table: pa.Table) -> pa.Table:
     )
     ts_array = ts_array.cast(pa.timestamp("us", tz="UTC"))
 
-    # --- geometry (WKB POINT) ---
-    lons = table.column("longitude").to_pylist()
-    lats = table.column("latitude").to_pylist()
-    wkb_points = [
-        _make_wkb_point(lon, lat) if lon is not None and lat is not None else None
-        for lon, lat in zip(lons, lats)
-    ]
-    geom_array = pa.array(wkb_points, type=pa.binary())
+    # --- geometry (WKB POINT) + h3_res15 in a single pass ---
+    # Use numpy arrays instead of to_pylist() to avoid expensive Python object creation
+    lons_np = table.column("longitude").to_numpy(zero_copy_only=False)
+    lats_np = table.column("latitude").to_numpy(zero_copy_only=False)
+    valid = ~(np.isnan(lons_np) | np.isnan(lats_np))
 
-    # --- h3_res15 ---
-    h3_cells = [
-        int(h3.latlng_to_cell(lat, lon, 15), 16)
-        if lat is not None and lon is not None
-        else None
-        for lat, lon in zip(lats, lons)
-    ]
+    n = len(lons_np)
+    prefix = _WKB_BYTE_ORDER + _WKB_POINT_TYPE
+    wkb_points: list[bytes | None] = [None] * n
+    h3_cells: list[int | None] = [None] * n
+    for i in range(n):
+        if valid[i]:
+            lon = float(lons_np[i])
+            lat = float(lats_np[i])
+            wkb_points[i] = prefix + struct.pack("<dd", lon, lat)
+            h3_cells[i] = h3_np.latlng_to_cell(lat, lon, 15)
+
+    geom_array = pa.array(wkb_points, type=pa.binary())
     h3_array = pa.array(h3_cells, type=pa.uint64())
 
     table = table.append_column("timestamp", ts_array)
@@ -513,10 +516,12 @@ def convert_year(
     year: int,
     data_dir: Path,
     delete_raw: bool = False,
+    workers: int = 1,
 ) -> list[tuple[Path, Path]]:
     """Convert all raw files for a given year to Parquet.
 
     Returns a list of (main_parquet_path, index_parquet_path) tuples.
+    When *workers* > 1, files are converted in parallel using a process pool.
     """
     raw_dir = data_dir / "raw" / str(year)
     if not raw_dir.exists():
@@ -533,11 +538,25 @@ def convert_year(
         return []
 
     converted: list[tuple[Path, Path]] = []
-    for raw_path in raw_files:
-        try:
-            out = convert_file(raw_path, data_dir, delete_raw=delete_raw)
-            converted.append(out)
-        except Exception as e:
-            print(f"Failed to convert {raw_path.name}: {e}")
+
+    if workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(convert_file, p, data_dir, delete_raw): p
+                for p in raw_files
+            }
+            for future in as_completed(futures):
+                raw_path = futures[future]
+                try:
+                    converted.append(future.result())
+                except Exception as e:
+                    print(f"Failed to convert {raw_path.name}: {e}")
+    else:
+        for raw_path in raw_files:
+            try:
+                out = convert_file(raw_path, data_dir, delete_raw=delete_raw)
+                converted.append(out)
+            except Exception as e:
+                print(f"Failed to convert {raw_path.name}: {e}")
 
     return converted

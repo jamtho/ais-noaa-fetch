@@ -38,6 +38,7 @@ uv run ais-noaa-fetch convert --year 2024
 | `--year YYYY` | `convert` | Year to convert (required) |
 | `--force` | `run`, `fetch` | Re-download existing files |
 | `--delete-raw` | `run`, `convert` | Delete raw files after conversion |
+| `--workers N` | `run`, `convert` | Parallel conversion workers (default: `1`) |
 
 ## Data layout
 

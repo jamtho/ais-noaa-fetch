@@ -44,6 +44,7 @@ def cmd_convert(args: argparse.Namespace) -> None:
         year=args.year,
         data_dir=data_dir,
         delete_raw=args.delete_raw,
+        workers=args.workers,
     )
 
 
@@ -56,11 +57,27 @@ def cmd_run(args: argparse.Namespace) -> None:
         data_dir=data_dir,
         force=args.force,
     )
-    for raw_path in downloaded:
-        try:
-            convert_file(raw_path, data_dir, delete_raw=args.delete_raw)
-        except Exception as e:
-            print(f"Failed to convert {raw_path.name}: {e}")
+    workers = args.workers
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(convert_file, p, data_dir, args.delete_raw): p
+                for p in downloaded
+            }
+            for future in as_completed(futures):
+                raw_path = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Failed to convert {raw_path.name}: {e}")
+    else:
+        for raw_path in downloaded:
+            try:
+                convert_file(raw_path, data_dir, delete_raw=args.delete_raw)
+            except Exception as e:
+                print(f"Failed to convert {raw_path.name}: {e}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete raw files after conversion",
     )
+    convert_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for conversion (default: 1)",
+    )
     convert_parser.set_defaults(func=cmd_convert)
 
     # --- run ---
@@ -110,6 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--delete-raw",
         action="store_true",
         help="Delete raw files after conversion",
+    )
+    run_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for conversion (default: 1)",
     )
     run_parser.set_defaults(func=cmd_run)
 
