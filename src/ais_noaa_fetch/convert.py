@@ -55,7 +55,7 @@ _COLUMN_RENAME = {
 
 # Column types keyed by canonical name
 COLUMN_TYPES = {
-    "mmsi": pa.string(),
+    "mmsi": pa.int32(),
     "base_date_time": pa.string(),
     "latitude": pa.float64(),
     "longitude": pa.float64(),
@@ -205,7 +205,7 @@ def _haversine_m(
 
 # Index schema for the per-MMSI daily summary
 _INDEX_SCHEMA = pa.schema([
-    ("mmsi", pa.string()),
+    ("mmsi", pa.int32()),
     ("date", pa.date32()),
     # Identity & metadata
     ("vessel_names", pa.list_(pa.string())),

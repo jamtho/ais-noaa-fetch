@@ -64,7 +64,7 @@ Each broadcast file contains 21 columns — 17 from the raw NOAA data plus 4 der
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `mmsi` | string | Maritime Mobile Service Identity |
+| `mmsi` | int32 | Maritime Mobile Service Identity |
 | **`date`** | **date32** | **Derived — file date** |
 | `base_date_time` | string | Original timestamp string |
 | `latitude` | float64 | Latitude |
