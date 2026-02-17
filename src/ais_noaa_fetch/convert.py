@@ -393,6 +393,56 @@ def _build_index(table: pa.Table, date_str: str) -> pa.Table:
     return pa.table(arrays, schema=_INDEX_SCHEMA)
 
 
+def _clean_mmsi(table: pa.Table) -> pa.Table:
+    """Drop rows with invalid MMSI values that cannot be cast to int32.
+
+    NOAA data occasionally contains dirty MMSI values: 10-digit numbers
+    exceeding int32 range, letter-prefixed strings, or fractional floats.
+    """
+    mmsi_col = table.column("mmsi")
+
+    if mmsi_col.type == pa.int32():
+        return table
+
+    if pa.types.is_integer(mmsi_col.type):
+        valid = pc.and_(
+            pc.greater_equal(mmsi_col, pa.scalar(0, mmsi_col.type)),
+            pc.less_equal(mmsi_col, pa.scalar(2_147_483_647, mmsi_col.type)),
+        )
+    elif pa.types.is_floating(mmsi_col.type):
+        is_valid = pc.is_valid(mmsi_col)
+        is_finite = pc.is_finite(mmsi_col)
+        is_whole = pc.equal(mmsi_col, pc.floor(mmsi_col))
+        in_range = pc.and_(
+            pc.greater_equal(mmsi_col, pa.scalar(0.0)),
+            pc.less_equal(mmsi_col, pa.scalar(2_147_483_647.0)),
+        )
+        valid = pc.and_(
+            pc.and_(is_valid, is_finite),
+            pc.and_(is_whole, in_range),
+        )
+    else:
+        # String — may contain letter prefixes or other garbage
+        not_null = pc.is_valid(mmsi_col)
+        is_digit = pc.if_else(not_null, pc.utf8_is_digit(mmsi_col), False)
+        str_len = pc.if_else(
+            not_null, pc.utf8_length(mmsi_col), pa.scalar(0, pa.int32())
+        )
+        fits_int32 = pc.and_(
+            pc.greater(str_len, pa.scalar(0, pa.int32())),
+            pc.less_equal(str_len, pa.scalar(9, pa.int32())),
+        )
+        valid = pc.and_(is_digit, fits_int32)
+
+    n_total = table.num_rows
+    table = table.filter(valid)
+    n_dropped = n_total - table.num_rows
+    if n_dropped:
+        print(f"  Dropped {n_dropped:,} rows with invalid MMSI values")
+
+    return table
+
+
 def _read_csv_bytes(data: bytes) -> pa.Table:
     """Read CSV bytes into a PyArrow table with normalized column names."""
     parse_options = pcsv.ParseOptions(delimiter=",")
@@ -404,6 +454,9 @@ def _read_csv_bytes(data: bytes) -> pa.Table:
         convert_options=convert_options,
     )
     table = _normalize_columns(table)
+
+    # Drop rows with dirty MMSI values before type casting
+    table = _clean_mmsi(table)
 
     # Cast to canonical types
     fields = []

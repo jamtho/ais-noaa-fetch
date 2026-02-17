@@ -21,6 +21,7 @@ import zstandard as zstd
 from ais_noaa_fetch.convert import (
     CANONICAL_COLUMNS,
     _INDEX_SCHEMA,
+    _clean_mmsi,
     _extract_date,
     _haversine_m,
     convert_file,
@@ -230,3 +231,59 @@ class TestIndexParquet:
         assert rows[987654321]["h3_cell_count"] == 1
         # Moving vessel should have > 1 (3 distinct points)
         assert rows[123456789]["h3_cell_count"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Dirty MMSI handling
+# ---------------------------------------------------------------------------
+
+
+class TestCleanMmsi:
+    def test_overflow_int64(self) -> None:
+        """10-digit MMSI exceeding int32 range is dropped."""
+        table = pa.table({"mmsi": pa.array([123456789, 5303533000], type=pa.int64())})
+        cleaned = _clean_mmsi(table)
+        assert cleaned.num_rows == 1
+        assert cleaned.column("mmsi")[0].as_py() == 123456789
+
+    def test_letter_prefix_string(self) -> None:
+        """Letter-prefixed MMSI string is dropped."""
+        table = pa.table({"mmsi": pa.array(["123456789", "I367333430"])})
+        cleaned = _clean_mmsi(table)
+        assert cleaned.num_rows == 1
+        assert cleaned.column("mmsi")[0].as_py() == "123456789"
+
+    def test_float_mmsi(self) -> None:
+        """Fractional float MMSI is dropped."""
+        table = pa.table({"mmsi": pa.array([123456789.0, 0.366503])})
+        cleaned = _clean_mmsi(table)
+        assert cleaned.num_rows == 1
+        assert cleaned.column("mmsi")[0].as_py() == 123456789.0
+
+    def test_int32_passthrough(self) -> None:
+        """Already-int32 column passes through unchanged."""
+        table = pa.table({"mmsi": pa.array([100, 200], type=pa.int32())})
+        cleaned = _clean_mmsi(table)
+        assert cleaned.num_rows == 2
+
+    def test_dirty_csv_converts(self, tmp_path: Path) -> None:
+        """Full pipeline succeeds on CSV with dirty MMSI rows."""
+        csv = (
+            "MMSI,BaseDateTime,LAT,LON,SOG,COG,Heading,VesselName,"
+            "IMO,CallSign,VesselType,Status,Length,Width,Draft,Cargo,"
+            "TransceiverClass\n"
+            "123456789,2025-01-15 10:00:00,29.0,-90.0,5.0,180.0,180.0,"
+            "GOOD,IMO1234567,WXY1234,70,0,100.0,20.0,5.0,70,A\n"
+            "5303533000,2025-01-15 10:00:00,29.0,-90.0,5.0,180.0,180.0,"
+            "BAD OVERFLOW,IMO0000000,XXX0000,70,0,100.0,20.0,5.0,70,A\n"
+        )
+        raw_dir = tmp_path / "raw" / "2025"
+        raw_dir.mkdir(parents=True)
+        cctx = zstd.ZstdCompressor()
+        path = raw_dir / "ais-2025-01-15.csv.zst"
+        path.write_bytes(cctx.compress(csv.encode()))
+
+        broadcast_path, index_path = convert_file(path, tmp_path)
+        table = pq.read_table(broadcast_path)
+        assert table.num_rows == 1
+        assert table.column("mmsi")[0].as_py() == 123456789
