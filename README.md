@@ -137,7 +137,7 @@ One row per MMSI per day. Enables fast lookups and filtering without scanning th
 
 ## GeoParquet
 
-Broadcast files are [GeoParquet 1.1.0](https://geoparquet.org/) compliant — WKB-encoded Point geometries in EPSG:4326 (WGS 84), zstd compressed.
+Broadcast files are [GeoParquet 1.0.0](https://geoparquet.org/) compliant — WKB-encoded Point geometries in EPSG:4326 (WGS 84), zstd compressed.
 
 Works natively with DuckDB Spatial and GeoPandas:
 

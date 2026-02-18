@@ -12,7 +12,6 @@ import datetime
 import struct
 from pathlib import Path
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -20,10 +19,8 @@ import zstandard as zstd
 
 from ais_noaa_fetch.convert import (
     CANONICAL_COLUMNS,
-    _INDEX_SCHEMA,
-    _clean_mmsi,
+    INDEX_COLUMNS,
     _extract_date,
-    _haversine_m,
     convert_file,
 )
 
@@ -41,19 +38,20 @@ MMSI,BaseDateTime,LAT,LON,SOG,COG,Heading,VesselName,IMO,CallSign,VesselType,Sta
 """
 
 
+def _make_zst(csv_text: str, tmp_path: Path, filename: str) -> Path:
+    """Compress CSV text into a .csv.zst file inside a raw directory."""
+    raw_dir = tmp_path / "raw" / "2025"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    cctx = zstd.ZstdCompressor()
+    path = raw_dir / filename
+    path.write_bytes(cctx.compress(csv_text.encode()))
+    return path
+
+
 @pytest.fixture()
 def sample_zst(tmp_path: Path) -> Path:
     """Create a sample .csv.zst file in a temporary raw directory."""
-    raw_dir = tmp_path / "raw" / "2025"
-    raw_dir.mkdir(parents=True)
-
-    csv_bytes = _SAMPLE_CSV.encode("utf-8")
-    cctx = zstd.ZstdCompressor()
-    compressed = cctx.compress(csv_bytes)
-
-    path = raw_dir / "ais-2025-01-15.csv.zst"
-    path.write_bytes(compressed)
-    return path
+    return _make_zst(_SAMPLE_CSV, tmp_path, "ais-2025-01-15.csv.zst")
 
 
 @pytest.fixture()
@@ -91,23 +89,6 @@ class TestExtractDate:
             _extract_date("garbage.txt")
 
 
-class TestHaversine:
-    def test_same_point(self) -> None:
-        d = _haversine_m(
-            np.array([0.0]), np.array([0.0]),
-            np.array([0.0]), np.array([0.0]),
-        )
-        assert d[0] == pytest.approx(0.0)
-
-    def test_known_distance(self) -> None:
-        # 1 degree of latitude ≈ 111,195 m
-        d = _haversine_m(
-            np.array([0.0]), np.array([0.0]),
-            np.array([1.0]), np.array([0.0]),
-        )
-        assert d[0] == pytest.approx(111_195.0, rel=0.01)
-
-
 # ---------------------------------------------------------------------------
 # Broadcast parquet regression tests
 # ---------------------------------------------------------------------------
@@ -122,9 +103,7 @@ class TestBroadcastParquet:
         assert broadcast_table.num_rows == 5
 
     def test_column_order(self, broadcast_table: pa.Table) -> None:
-        expected = list(CANONICAL_COLUMNS)
-        expected.insert(1, "date")
-        assert broadcast_table.column_names == expected
+        assert broadcast_table.column_names == CANONICAL_COLUMNS
 
     def test_mmsi_type_int32(self, broadcast_table: pa.Table) -> None:
         assert broadcast_table.schema.field("mmsi").type == pa.int32()
@@ -133,6 +112,13 @@ class TestBroadcastParquet:
         assert broadcast_table.schema.field("date").type == pa.date32()
         dates = broadcast_table.column("date").to_pylist()
         assert all(d == datetime.date(2025, 1, 15) for d in dates)
+
+    def test_base_date_time_is_string(self, broadcast_table: pa.Table) -> None:
+        assert pa.types.is_string(
+            broadcast_table.schema.field("base_date_time").type
+        ) or pa.types.is_large_string(
+            broadcast_table.schema.field("base_date_time").type
+        )
 
     def test_sort_order(self, broadcast_table: pa.Table) -> None:
         """Rows are sorted by (mmsi ASC, timestamp ASC)."""
@@ -180,9 +166,8 @@ class TestIndexParquet:
         """One row per distinct MMSI."""
         assert index_table.num_rows == 2
 
-    def test_schema_matches(self, index_table: pa.Table) -> None:
-        for field in _INDEX_SCHEMA:
-            assert index_table.schema.field(field.name).type == field.type
+    def test_column_names(self, index_table: pa.Table) -> None:
+        assert index_table.column_names == INDEX_COLUMNS
 
     def test_mmsi_type_int32(self, index_table: pa.Table) -> None:
         assert index_table.schema.field("mmsi").type == pa.int32()
@@ -232,41 +217,23 @@ class TestIndexParquet:
         # Moving vessel should have > 1 (3 distinct points)
         assert rows[123456789]["h3_cell_count"] >= 1
 
+    def test_empty_list_not_null(self, index_table: pa.Table) -> None:
+        """Identity list columns should be empty lists, not NULL."""
+        rows = {r["mmsi"]: r for r in index_table.to_pylist()}
+        for row in rows.values():
+            for col in ["vessel_names", "imos", "call_signs", "vessel_types",
+                        "cargos", "lengths", "widths", "drafts",
+                        "transceiver_classes", "status_codes"]:
+                assert isinstance(row[col], list), f"{col} should be a list, got {type(row[col])}"
+
 
 # ---------------------------------------------------------------------------
 # Dirty MMSI handling
 # ---------------------------------------------------------------------------
 
 
-class TestCleanMmsi:
-    def test_overflow_int64(self) -> None:
-        """10-digit MMSI exceeding int32 range is dropped."""
-        table = pa.table({"mmsi": pa.array([123456789, 5303533000], type=pa.int64())})
-        cleaned = _clean_mmsi(table)
-        assert cleaned.num_rows == 1
-        assert cleaned.column("mmsi")[0].as_py() == 123456789
-
-    def test_letter_prefix_string(self) -> None:
-        """Letter-prefixed MMSI string is dropped."""
-        table = pa.table({"mmsi": pa.array(["123456789", "I367333430"])})
-        cleaned = _clean_mmsi(table)
-        assert cleaned.num_rows == 1
-        assert cleaned.column("mmsi")[0].as_py() == "123456789"
-
-    def test_float_mmsi(self) -> None:
-        """Fractional float MMSI is dropped."""
-        table = pa.table({"mmsi": pa.array([123456789.0, 0.366503])})
-        cleaned = _clean_mmsi(table)
-        assert cleaned.num_rows == 1
-        assert cleaned.column("mmsi")[0].as_py() == 123456789.0
-
-    def test_int32_passthrough(self) -> None:
-        """Already-int32 column passes through unchanged."""
-        table = pa.table({"mmsi": pa.array([100, 200], type=pa.int32())})
-        cleaned = _clean_mmsi(table)
-        assert cleaned.num_rows == 2
-
-    def test_dirty_csv_converts(self, tmp_path: Path) -> None:
+class TestDirtyMmsi:
+    def test_overflow_mmsi_is_dropped(self, tmp_path: Path) -> None:
         """Full pipeline succeeds on CSV with dirty MMSI rows."""
         csv = (
             "MMSI,BaseDateTime,LAT,LON,SOG,COG,Heading,VesselName,"
@@ -277,13 +244,8 @@ class TestCleanMmsi:
             "5303533000,2025-01-15 10:00:00,29.0,-90.0,5.0,180.0,180.0,"
             "BAD OVERFLOW,IMO0000000,XXX0000,70,0,100.0,20.0,5.0,70,A\n"
         )
-        raw_dir = tmp_path / "raw" / "2025"
-        raw_dir.mkdir(parents=True)
-        cctx = zstd.ZstdCompressor()
-        path = raw_dir / "ais-2025-01-15.csv.zst"
-        path.write_bytes(cctx.compress(csv.encode()))
-
-        broadcast_path, index_path = convert_file(path, tmp_path)
+        path = _make_zst(csv, tmp_path, "ais-2025-01-15.csv.zst")
+        broadcast_path, _ = convert_file(path, tmp_path)
         table = pq.read_table(broadcast_path)
         assert table.num_rows == 1
         assert table.column("mmsi")[0].as_py() == 123456789

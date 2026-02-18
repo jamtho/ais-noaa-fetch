@@ -8,30 +8,13 @@
 
 from __future__ import annotations
 
-import datetime
-import io
-import json
 import re
-import struct
+import tempfile
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-from h3.api import numpy_int as h3_np
-import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.csv as pcsv
-import pyarrow.parquet as pq
-import zstandard as zstd
-
-# Canonical column names (2025+ snake_case format)
-CANONICAL_COLUMNS = [
-    "mmsi", "base_date_time", "latitude", "longitude", "sog", "cog",
-    "heading", "vessel_name", "imo", "call_sign", "vessel_type", "status",
-    "length", "width", "draft", "cargo", "transceiver",
-    "timestamp", "geometry", "h3_res15",
-]
+import duckdb
 
 # Map old column names (pre-2025) to canonical names
 _COLUMN_RENAME = {
@@ -54,117 +37,29 @@ _COLUMN_RENAME = {
     "TransceiverClass": "transceiver",
 }
 
-# Column types keyed by canonical name
-COLUMN_TYPES = {
-    "mmsi": pa.int32(),
-    "base_date_time": pa.string(),
-    "latitude": pa.float64(),
-    "longitude": pa.float64(),
-    "sog": pa.float64(),
-    "cog": pa.float64(),
-    "heading": pa.float64(),
-    "vessel_name": pa.string(),
-    "imo": pa.string(),
-    "call_sign": pa.string(),
-    "vessel_type": pa.int32(),
-    "status": pa.int32(),
-    "length": pa.float64(),
-    "width": pa.float64(),
-    "draft": pa.float64(),
-    "cargo": pa.int32(),
-    "transceiver": pa.string(),
-}
+# Reverse mapping: canonical name -> old column name
+_CANONICAL_TO_OLD = {v: k for k, v in _COLUMN_RENAME.items()}
 
+# Canonical column order for broadcast parquet (including derived columns)
+CANONICAL_COLUMNS = [
+    "mmsi", "date", "base_date_time", "latitude", "longitude", "sog", "cog",
+    "heading", "vessel_name", "imo", "call_sign", "vessel_type", "status",
+    "length", "width", "draft", "cargo", "transceiver",
+    "timestamp", "geometry", "h3_res15",
+]
 
-# WKB constants for POINT geometry (little-endian)
-_WKB_BYTE_ORDER = b"\x01"  # little-endian
-_WKB_POINT_TYPE = struct.pack("<I", 1)  # wkbPoint = 1
-
-# GeoParquet metadata template
-_GEO_METADATA = {
-    "version": "1.1.0",
-    "primary_column": "geometry",
-    "columns": {
-        "geometry": {
-            "encoding": "WKB",
-            "geometry_types": ["Point"],
-            "crs": {
-                "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
-                "type": "GeographicCRS",
-                "name": "WGS 84",
-                "datum": {
-                    "type": "GeodeticReferenceFrame",
-                    "name": "World Geodetic System 1984",
-                    "ellipsoid": {
-                        "name": "WGS 84",
-                        "semi_major_axis": 6378137,
-                        "inverse_flattening": 298.257223563,
-                    },
-                },
-                "coordinate_system": {
-                    "subtype": "ellipsoidal",
-                    "axis": [
-                        {
-                            "name": "Geodetic latitude",
-                            "abbreviation": "Lat",
-                            "direction": "north",
-                            "unit": "degree",
-                        },
-                        {
-                            "name": "Geodetic longitude",
-                            "abbreviation": "Lon",
-                            "direction": "east",
-                            "unit": "degree",
-                        },
-                    ],
-                },
-                "id": {"authority": "EPSG", "code": 4326},
-            },
-            "bbox": [-180.0, -90.0, 180.0, 90.0],
-        }
-    },
-}
-
-
-def _make_wkb_point(lon: float, lat: float) -> bytes:
-    """Build a WKB POINT (little-endian, 21 bytes)."""
-    return _WKB_BYTE_ORDER + _WKB_POINT_TYPE + struct.pack("<dd", lon, lat)
-
-
-def _add_derived_columns(table: pa.Table) -> pa.Table:
-    """Add timestamp, geometry, and h3_res15 columns to the table."""
-    # --- timestamp ---
-    ts_array = pc.strptime(
-        table.column("base_date_time"),
-        format="%Y-%m-%d %H:%M:%S",
-        unit="us",
-    )
-    ts_array = ts_array.cast(pa.timestamp("us", tz="UTC"))
-
-    # --- geometry (WKB POINT) + h3_res15 in a single pass ---
-    # Use numpy arrays instead of to_pylist() to avoid expensive Python object creation
-    lons_np = table.column("longitude").to_numpy(zero_copy_only=False)
-    lats_np = table.column("latitude").to_numpy(zero_copy_only=False)
-    valid = ~(np.isnan(lons_np) | np.isnan(lats_np))
-
-    n = len(lons_np)
-    prefix = _WKB_BYTE_ORDER + _WKB_POINT_TYPE
-    wkb_points: list[bytes | None] = [None] * n
-    h3_cells: list[int | None] = [None] * n
-    for i in range(n):
-        if valid[i]:
-            lon = float(lons_np[i])
-            lat = float(lats_np[i])
-            wkb_points[i] = prefix + struct.pack("<dd", lon, lat)
-            h3_cells[i] = h3_np.latlng_to_cell(lat, lon, 15)
-
-    geom_array = pa.array(wkb_points, type=pa.binary())
-    h3_array = pa.array(h3_cells, type=pa.uint64())
-
-    table = table.append_column("timestamp", ts_array)
-    table = table.append_column("geometry", geom_array)
-    table = table.append_column("h3_res15", h3_array)
-    return table
+# Index column names for the per-MMSI daily summary
+INDEX_COLUMNS = [
+    "mmsi", "date",
+    "vessel_names", "imos", "call_signs", "vessel_types", "cargos",
+    "lengths", "widths", "drafts", "transceiver_classes",
+    "message_count", "first_timestamp", "last_timestamp", "duration_s",
+    "centroid_lat", "centroid_lon",
+    "min_lat", "max_lat", "min_lon", "max_lon",
+    "distance_m", "h3_cell_count",
+    "sog_min", "sog_max", "sog_mean", "max_inter_msg_speed_ms",
+    "status_codes",
+]
 
 
 def _extract_date(filename: str) -> str:
@@ -183,312 +78,6 @@ def _extract_date(filename: str) -> str:
     raise ValueError(f"Cannot extract date from filename: {filename}")
 
 
-def _normalize_columns(table: pa.Table) -> pa.Table:
-    """Rename columns to canonical snake_case names."""
-    new_names = [_COLUMN_RENAME.get(name, name) for name in table.column_names]
-    return table.rename_columns(new_names)
-
-
-_EARTH_RADIUS_M = 6_371_000.0
-
-
-def _haversine_m(
-    lat1: np.ndarray,
-    lon1: np.ndarray,
-    lat2: np.ndarray,
-    lon2: np.ndarray,
-) -> np.ndarray:
-    """Vectorized haversine distance in metres between consecutive points."""
-    lat1, lon1, lat2, lon2 = (np.radians(a) for a in (lat1, lon1, lat2, lon2))
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    return 2 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
-
-
-# Index schema for the per-MMSI daily summary
-_INDEX_SCHEMA = pa.schema([
-    ("mmsi", pa.int32()),
-    ("date", pa.date32()),
-    # Identity & metadata
-    ("vessel_names", pa.list_(pa.string())),
-    ("imos", pa.list_(pa.string())),
-    ("call_signs", pa.list_(pa.string())),
-    ("vessel_types", pa.list_(pa.int32())),
-    ("cargos", pa.list_(pa.int32())),
-    ("lengths", pa.list_(pa.float64())),
-    ("widths", pa.list_(pa.float64())),
-    ("drafts", pa.list_(pa.float64())),
-    ("transceiver_classes", pa.list_(pa.string())),
-    # Message stats
-    ("message_count", pa.int64()),
-    ("first_timestamp", pa.timestamp("us", tz="UTC")),
-    ("last_timestamp", pa.timestamp("us", tz="UTC")),
-    ("duration_s", pa.float64()),
-    # Geospatial
-    ("centroid_lat", pa.float64()),
-    ("centroid_lon", pa.float64()),
-    ("min_lat", pa.float64()),
-    ("max_lat", pa.float64()),
-    ("min_lon", pa.float64()),
-    ("max_lon", pa.float64()),
-    ("distance_m", pa.float64()),
-    ("h3_cell_count", pa.int64()),
-    # Navigation
-    ("sog_min", pa.float64()),
-    ("sog_max", pa.float64()),
-    ("sog_mean", pa.float64()),
-    ("max_inter_msg_speed_ms", pa.float64()),
-    ("status_codes", pa.list_(pa.int32())),
-])
-
-
-def _build_index(table: pa.Table, date_str: str) -> pa.Table:
-    """Build a per-MMSI daily index/summary from a sorted position table.
-
-    ``table`` must already be sorted by (mmsi, timestamp).
-    """
-    date_val = datetime.date.fromisoformat(date_str)
-
-    # Extract columns as numpy / python arrays for fast iteration
-    mmsi_arr = table.column("mmsi").to_pylist()
-    lat_np = table.column("latitude").to_numpy(zero_copy_only=False)
-    lon_np = table.column("longitude").to_numpy(zero_copy_only=False)
-    sog_np = table.column("sog").to_numpy(zero_copy_only=False)
-    h3_arr = table.column("h3_res15").to_pylist()
-    vname_arr = table.column("vessel_name").to_pylist()
-    imo_arr = table.column("imo").to_pylist()
-    csign_arr = table.column("call_sign").to_pylist()
-    vtype_arr = table.column("vessel_type").to_pylist()
-    status_arr = table.column("status").to_pylist()
-    cargo_arr = table.column("cargo").to_pylist()
-    length_arr = table.column("length").to_pylist()
-    width_arr = table.column("width").to_pylist()
-    draft_arr = table.column("draft").to_pylist()
-    trans_arr = table.column("transceiver").to_pylist()
-
-    # Timestamps as int64 microseconds (avoids tzdata dependency on Windows)
-    ts_us = table.column("timestamp").to_numpy(zero_copy_only=False).astype("int64")
-
-    # Pre-compute haversine distances between consecutive rows
-    dists = np.empty(len(lat_np), dtype=np.float64)
-    dists[0] = 0.0
-    if len(lat_np) > 1:
-        dists[1:] = _haversine_m(lat_np[:-1], lon_np[:-1], lat_np[1:], lon_np[1:])
-
-    # Pre-compute time deltas (seconds) between consecutive rows
-    td_s = np.empty(len(ts_us), dtype=np.float64)
-    td_s[0] = 0.0
-    if len(ts_us) > 1:
-        td_s[1:] = (ts_us[1:] - ts_us[:-1]) / 1_000_000.0  # microseconds -> seconds
-
-    n = len(mmsi_arr)
-
-    # Output accumulators — one list per column
-    out: dict[str, list] = {field.name: [] for field in _INDEX_SCHEMA}
-
-    def _emit(start: int, end: int) -> None:
-        """Emit one index row for rows [start, end)."""
-        out["mmsi"].append(mmsi_arr[start])
-        out["date"].append(date_val)
-
-        # Distinct value sets — identity/metadata
-        def _distinct_str(arr: list, s: int, e: int) -> list[str]:
-            return sorted({v for v in arr[s:e] if v is not None})
-
-        def _distinct_int(arr: list, s: int, e: int) -> list[int]:
-            return sorted({v for v in arr[s:e] if v is not None})
-
-        def _distinct_float(arr: list, s: int, e: int) -> list[float]:
-            vals = {v for v in arr[s:e] if v is not None}
-            return sorted(vals)
-
-        out["vessel_names"].append(_distinct_str(vname_arr, start, end))
-        out["imos"].append(_distinct_str(imo_arr, start, end))
-        out["call_signs"].append(_distinct_str(csign_arr, start, end))
-        out["vessel_types"].append(_distinct_int(vtype_arr, start, end))
-        out["cargos"].append(_distinct_int(cargo_arr, start, end))
-        out["lengths"].append(_distinct_float(length_arr, start, end))
-        out["widths"].append(_distinct_float(width_arr, start, end))
-        out["drafts"].append(_distinct_float(draft_arr, start, end))
-        out["transceiver_classes"].append(_distinct_str(trans_arr, start, end))
-
-        # Message stats
-        count = end - start
-        out["message_count"].append(count)
-        first_us = int(ts_us[start])
-        last_us = int(ts_us[end - 1])
-        out["first_timestamp"].append(first_us)
-        out["last_timestamp"].append(last_us)
-        out["duration_s"].append((last_us - first_us) / 1_000_000.0)
-
-        # Geospatial
-        slat = lat_np[start:end]
-        slon = lon_np[start:end]
-        valid_lat = slat[~np.isnan(slat)]
-        valid_lon = slon[~np.isnan(slon)]
-        out["centroid_lat"].append(float(np.mean(valid_lat)) if len(valid_lat) else None)
-        out["centroid_lon"].append(float(np.mean(valid_lon)) if len(valid_lon) else None)
-        out["min_lat"].append(float(np.min(valid_lat)) if len(valid_lat) else None)
-        out["max_lat"].append(float(np.max(valid_lat)) if len(valid_lat) else None)
-        out["min_lon"].append(float(np.min(valid_lon)) if len(valid_lon) else None)
-        out["max_lon"].append(float(np.max(valid_lon)) if len(valid_lon) else None)
-
-        # Distance — sum haversine for consecutive points within this MMSI
-        # The first row of each group has dist=0 (computed globally, but the
-        # first row of a new MMSI's segment should not use the previous MMSI's
-        # last point). We zeroed dists[0] globally; for subsequent groups the
-        # cross-boundary dist is wrong, so we exclude it.
-        group_dists = dists[start:end].copy()
-        group_dists[0] = 0.0  # first row has no predecessor in this group
-        # Mask out NaN distances (from NaN lat/lon)
-        valid_d = group_dists[~np.isnan(group_dists)]
-        out["distance_m"].append(float(np.sum(valid_d)))
-
-        # H3 cell count
-        h3_set = {v for v in h3_arr[start:end] if v is not None}
-        out["h3_cell_count"].append(len(h3_set))
-
-        # Navigation
-        ssog = sog_np[start:end]
-        valid_sog = ssog[~np.isnan(ssog)]
-        out["sog_min"].append(float(np.min(valid_sog)) if len(valid_sog) else None)
-        out["sog_max"].append(float(np.max(valid_sog)) if len(valid_sog) else None)
-        out["sog_mean"].append(float(np.mean(valid_sog)) if len(valid_sog) else None)
-
-        # Max inter-message speed (m/s)
-        if count >= 2:
-            group_td = td_s[start:end].copy()
-            group_td[0] = 0.0
-            group_d = dists[start:end].copy()
-            group_d[0] = 0.0
-            # Only where time delta > 0 to avoid division by zero
-            mask = group_td > 0
-            if np.any(mask):
-                speeds = group_d[mask] / group_td[mask]
-                valid_speeds = speeds[~np.isnan(speeds)]
-                out["max_inter_msg_speed_ms"].append(
-                    float(np.max(valid_speeds)) if len(valid_speeds) else None
-                )
-            else:
-                out["max_inter_msg_speed_ms"].append(None)
-        else:
-            out["max_inter_msg_speed_ms"].append(None)
-
-        out["status_codes"].append(_distinct_int(status_arr, start, end))
-
-    # Stream through sorted rows, emit when MMSI changes
-    if n > 0:
-        group_start = 0
-        cur_mmsi = mmsi_arr[0]
-        for i in range(1, n):
-            if mmsi_arr[i] != cur_mmsi:
-                _emit(group_start, i)
-                group_start = i
-                cur_mmsi = mmsi_arr[i]
-        _emit(group_start, n)
-
-    # Build the index table
-    arrays = [pa.array(out[field.name], type=field.type) for field in _INDEX_SCHEMA]
-    return pa.table(arrays, schema=_INDEX_SCHEMA)
-
-
-def _clean_mmsi(table: pa.Table) -> pa.Table:
-    """Drop rows with invalid MMSI values that cannot be cast to int32.
-
-    NOAA data occasionally contains dirty MMSI values: 10-digit numbers
-    exceeding int32 range, letter-prefixed strings, or fractional floats.
-    """
-    mmsi_col = table.column("mmsi")
-
-    if mmsi_col.type == pa.int32():
-        return table
-
-    if pa.types.is_integer(mmsi_col.type):
-        valid = pc.and_(
-            pc.greater_equal(mmsi_col, pa.scalar(0, mmsi_col.type)),
-            pc.less_equal(mmsi_col, pa.scalar(2_147_483_647, mmsi_col.type)),
-        )
-    elif pa.types.is_floating(mmsi_col.type):
-        is_valid = pc.is_valid(mmsi_col)
-        is_finite = pc.is_finite(mmsi_col)
-        is_whole = pc.equal(mmsi_col, pc.floor(mmsi_col))
-        in_range = pc.and_(
-            pc.greater_equal(mmsi_col, pa.scalar(0.0)),
-            pc.less_equal(mmsi_col, pa.scalar(2_147_483_647.0)),
-        )
-        valid = pc.and_(
-            pc.and_(is_valid, is_finite),
-            pc.and_(is_whole, in_range),
-        )
-    else:
-        # String — may contain letter prefixes or other garbage
-        not_null = pc.is_valid(mmsi_col)
-        is_digit = pc.if_else(not_null, pc.utf8_is_digit(mmsi_col), False)
-        str_len = pc.if_else(
-            not_null, pc.utf8_length(mmsi_col), pa.scalar(0, pa.int32())
-        )
-        fits_int32 = pc.and_(
-            pc.greater(str_len, pa.scalar(0, pa.int32())),
-            pc.less_equal(str_len, pa.scalar(9, pa.int32())),
-        )
-        valid = pc.and_(is_digit, fits_int32)
-
-    n_total = table.num_rows
-    table = table.filter(valid)
-    n_dropped = n_total - table.num_rows
-    if n_dropped:
-        print(f"  Dropped {n_dropped:,} rows with invalid MMSI values")
-
-    return table
-
-
-def _read_csv_bytes(data: bytes) -> pa.Table:
-    """Read CSV bytes into a PyArrow table with normalized column names."""
-    parse_options = pcsv.ParseOptions(delimiter=",")
-    convert_options = pcsv.ConvertOptions(strings_can_be_null=True)
-
-    table = pcsv.read_csv(
-        io.BytesIO(data),
-        parse_options=parse_options,
-        convert_options=convert_options,
-    )
-    table = _normalize_columns(table)
-
-    # Drop rows with dirty MMSI values before type casting
-    table = _clean_mmsi(table)
-
-    # Cast to canonical types
-    fields = []
-    for name in table.column_names:
-        if name in COLUMN_TYPES:
-            fields.append(pa.field(name, COLUMN_TYPES[name]))
-        else:
-            fields.append(pa.field(name, table.schema.field(name).type))
-    table = table.cast(pa.schema(fields))
-
-    # Add missing canonical columns as null (raw columns only)
-    raw_cols = [c for c in CANONICAL_COLUMNS if c in COLUMN_TYPES]
-    for col_name in raw_cols:
-        if col_name not in table.column_names:
-            table = table.append_column(
-                col_name, pa.nulls(len(table), type=COLUMN_TYPES[col_name])
-            )
-
-    # Add derived columns (timestamp, geometry, h3_res15)
-    table = _add_derived_columns(table)
-
-    # Enforce canonical column order
-    return table.select(CANONICAL_COLUMNS)
-
-
-def _decompress_zst(path: Path) -> bytes:
-    """Decompress a .csv.zst file and return CSV bytes."""
-    dctx = zstd.ZstdDecompressor()
-    with open(path, "rb") as f:
-        return dctx.decompress(f.read(), max_output_size=2 * 1024 * 1024 * 1024)
-
-
 def _extract_zip(path: Path) -> bytes:
     """Extract the CSV from a .zip file and return CSV bytes."""
     with zipfile.ZipFile(path) as zf:
@@ -498,6 +87,190 @@ def _extract_zip(path: Path) -> bytes:
         return zf.read(csv_names[0])
 
 
+def _col_ref(canonical: str, is_old_format: bool) -> str:
+    """Return a quoted SQL column reference for a canonical column name."""
+    if is_old_format:
+        return f'"{_CANONICAL_TO_OLD.get(canonical, canonical)}"'
+    return f'"{canonical}"'
+
+
+def _esc(path: str | Path) -> str:
+    """Escape a file path for embedding in a DuckDB SQL string literal."""
+    return str(path).replace("'", "''").replace("\\", "/")
+
+
+def _duckdb_pipeline(
+    csv_source: str,
+    date_str: str,
+    out_path: Path,
+    index_path: Path,
+) -> tuple[int, int]:
+    """Run the full conversion pipeline using DuckDB.
+
+    Returns (broadcast_row_count, index_mmsi_count).
+    """
+    con = duckdb.connect()
+    con.execute("INSTALL h3 FROM community; LOAD h3;")
+    con.execute("INSTALL spatial; LOAD spatial;")
+
+    csv_esc = _esc(csv_source)
+
+    # Read CSV — all_varchar avoids type detection issues (e.g. base_date_time
+    # auto-detected as TIMESTAMP in 2025+ files; we want it as VARCHAR).
+    con.execute(
+        f"CREATE VIEW raw AS SELECT * FROM read_csv('{csv_esc}', all_varchar=true)",
+    )
+
+    # Detect old (MMSI, BaseDateTime, …) vs new (mmsi, base_date_time, …)
+    cols = {r[0] for r in con.execute("DESCRIBE raw").fetchall()}
+    is_old = "MMSI" in cols
+
+    def c(name: str) -> str:
+        return _col_ref(name, is_old)
+
+    n_raw = con.execute("SELECT COUNT(*) FROM raw").fetchone()[0]
+
+    # Build broadcast table: clean MMSI, cast types, derive columns, sort.
+    # TRY_CAST on mmsi filters out dirty values (10-digit overflows,
+    # letter-prefixed strings, fractional floats) by returning NULL.
+    con.execute(f"""
+        CREATE TABLE broadcast AS
+        SELECT
+            TRY_CAST({c('mmsi')} AS INTEGER) AS mmsi,
+            '{date_str}'::DATE AS date,
+            {c('base_date_time')} AS base_date_time,
+            TRY_CAST({c('latitude')} AS DOUBLE) AS latitude,
+            TRY_CAST({c('longitude')} AS DOUBLE) AS longitude,
+            TRY_CAST({c('sog')} AS DOUBLE) AS sog,
+            TRY_CAST({c('cog')} AS DOUBLE) AS cog,
+            TRY_CAST({c('heading')} AS DOUBLE) AS heading,
+            {c('vessel_name')} AS vessel_name,
+            {c('imo')} AS imo,
+            {c('call_sign')} AS call_sign,
+            TRY_CAST({c('vessel_type')} AS INTEGER) AS vessel_type,
+            TRY_CAST({c('status')} AS INTEGER) AS status,
+            TRY_CAST({c('length')} AS DOUBLE) AS length,
+            TRY_CAST({c('width')} AS DOUBLE) AS width,
+            TRY_CAST({c('draft')} AS DOUBLE) AS draft,
+            TRY_CAST({c('cargo')} AS INTEGER) AS cargo,
+            {c('transceiver')} AS transceiver,
+            strptime({c('base_date_time')}, '%Y-%m-%d %H:%M:%S')
+                ::TIMESTAMPTZ AS timestamp,
+            ST_Point(
+                TRY_CAST({c('longitude')} AS DOUBLE),
+                TRY_CAST({c('latitude')} AS DOUBLE)
+            ) AS geometry,
+            h3_latlng_to_cell(
+                TRY_CAST({c('latitude')} AS DOUBLE),
+                TRY_CAST({c('longitude')} AS DOUBLE),
+                15
+            )::UBIGINT AS h3_res15
+        FROM raw
+        WHERE TRY_CAST({c('mmsi')} AS INTEGER) IS NOT NULL
+          AND TRY_CAST({c('mmsi')} AS INTEGER) BETWEEN 0 AND 2147483647
+        ORDER BY mmsi, timestamp
+    """)
+
+    n_clean = con.execute("SELECT COUNT(*) FROM broadcast").fetchone()[0]
+    n_dropped = n_raw - n_clean
+    if n_dropped:
+        print(f"  Dropped {n_dropped:,} rows with invalid MMSI values")
+
+    # Write broadcast parquet (spatial extension adds GeoParquet metadata)
+    con.execute(
+        f"COPY broadcast TO '{_esc(out_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+    )
+
+    # Build and write index using window functions + GROUP BY
+    con.execute(f"""
+        COPY (
+            WITH prev AS (
+                SELECT *,
+                    LAG(latitude) OVER w AS prev_lat,
+                    LAG(longitude) OVER w AS prev_lon,
+                    LAG(timestamp) OVER w AS prev_ts
+                FROM broadcast
+                WINDOW w AS (PARTITION BY mmsi ORDER BY timestamp)
+            ),
+            dists AS (
+                SELECT *,
+                    CASE
+                        WHEN prev_lat IS NOT NULL AND latitude IS NOT NULL
+                        THEN ST_Distance_Sphere(
+                                 ST_Point(longitude, latitude),
+                                 ST_Point(prev_lon, prev_lat))
+                        ELSE 0.0
+                    END AS dist_m,
+                    CASE
+                        WHEN prev_ts IS NOT NULL
+                        THEN EPOCH(timestamp - prev_ts)
+                        ELSE 0.0
+                    END AS dt_s
+                FROM prev
+            )
+            SELECT
+                mmsi,
+                '{date_str}'::DATE AS date,
+                COALESCE(list(DISTINCT vessel_name ORDER BY vessel_name)
+                    FILTER (WHERE vessel_name IS NOT NULL),
+                    []::VARCHAR[]) AS vessel_names,
+                COALESCE(list(DISTINCT imo ORDER BY imo)
+                    FILTER (WHERE imo IS NOT NULL),
+                    []::VARCHAR[]) AS imos,
+                COALESCE(list(DISTINCT call_sign ORDER BY call_sign)
+                    FILTER (WHERE call_sign IS NOT NULL),
+                    []::VARCHAR[]) AS call_signs,
+                COALESCE(list(DISTINCT vessel_type ORDER BY vessel_type)
+                    FILTER (WHERE vessel_type IS NOT NULL),
+                    []::INTEGER[]) AS vessel_types,
+                COALESCE(list(DISTINCT cargo ORDER BY cargo)
+                    FILTER (WHERE cargo IS NOT NULL),
+                    []::INTEGER[]) AS cargos,
+                COALESCE(list(DISTINCT length ORDER BY length)
+                    FILTER (WHERE length IS NOT NULL),
+                    []::DOUBLE[]) AS lengths,
+                COALESCE(list(DISTINCT width ORDER BY width)
+                    FILTER (WHERE width IS NOT NULL),
+                    []::DOUBLE[]) AS widths,
+                COALESCE(list(DISTINCT draft ORDER BY draft)
+                    FILTER (WHERE draft IS NOT NULL),
+                    []::DOUBLE[]) AS drafts,
+                COALESCE(list(DISTINCT transceiver ORDER BY transceiver)
+                    FILTER (WHERE transceiver IS NOT NULL),
+                    []::VARCHAR[]) AS transceiver_classes,
+                COUNT(*)::BIGINT AS message_count,
+                MIN(timestamp) AS first_timestamp,
+                MAX(timestamp) AS last_timestamp,
+                EPOCH(MAX(timestamp) - MIN(timestamp)) AS duration_s,
+                AVG(latitude) AS centroid_lat,
+                AVG(longitude) AS centroid_lon,
+                MIN(latitude) AS min_lat,
+                MAX(latitude) AS max_lat,
+                MIN(longitude) AS min_lon,
+                MAX(longitude) AS max_lon,
+                SUM(dist_m) AS distance_m,
+                COUNT(DISTINCT h3_res15)::BIGINT AS h3_cell_count,
+                MIN(sog) AS sog_min,
+                MAX(sog) AS sog_max,
+                AVG(sog) AS sog_mean,
+                MAX(CASE WHEN dt_s > 0 THEN dist_m / dt_s
+                    ELSE NULL END) AS max_inter_msg_speed_ms,
+                COALESCE(list(DISTINCT status ORDER BY status)
+                    FILTER (WHERE status IS NOT NULL),
+                    []::INTEGER[]) AS status_codes
+            FROM dists
+            GROUP BY mmsi
+            ORDER BY mmsi
+        ) TO '{_esc(index_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """)
+
+    n_mmsi = con.execute(
+        "SELECT COUNT(DISTINCT mmsi) FROM broadcast"
+    ).fetchone()[0]
+    con.close()
+    return n_clean, n_mmsi
+
+
 def convert_file(
     raw_path: Path,
     data_dir: Path,
@@ -505,9 +278,8 @@ def convert_file(
 ) -> tuple[Path, Path]:
     """Convert a single raw AIS file to Parquet.
 
-    Returns (main_parquet_path, index_parquet_path).
+    Returns (broadcast_parquet_path, index_parquet_path).
     """
-    # Determine year from parent directory name
     year = raw_path.parent.name
     date_str = _extract_date(raw_path.name)
 
@@ -516,52 +288,41 @@ def convert_file(
     broadcasts_dir.mkdir(parents=True, exist_ok=True)
     index_dir.mkdir(parents=True, exist_ok=True)
 
-    # Normalize output filename to ais-YYYY-MM-DD.parquet
     out_path = broadcasts_dir / f"ais-{date_str}.parquet"
     index_path = index_dir / f"ais-{date_str}.parquet"
 
-    # Decompress
+    print(f"Converting {raw_path.name} -> {out_path.name}")
+
+    # DuckDB reads .csv.zst natively; for .zip we extract to a temp file.
+    tmp_path: Path | None = None
     if raw_path.suffix == ".zst":
-        csv_bytes = _decompress_zst(raw_path)
+        csv_source = str(raw_path)
     elif raw_path.suffix == ".zip":
         csv_bytes = _extract_zip(raw_path)
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".csv", delete=False, dir=raw_path.parent,
+        )
+        tmp.write(csv_bytes)
+        tmp.close()
+        csv_source = tmp.name
+        tmp_path = Path(tmp.name)
     else:
         raise ValueError(f"Unsupported file type: {raw_path}")
 
-    print(f"Converting {raw_path.name} -> {out_path.name}")
-
-    table = _read_csv_bytes(csv_bytes)
-
-    # Add file date column
-    date_val = datetime.date.fromisoformat(date_str)
-    date_col = pa.array([date_val] * table.num_rows, type=pa.date32())
-    table = table.append_column("date", date_col)
-    # Reorder so date comes right after mmsi
-    cols = list(table.column_names)
-    cols.remove("date")
-    cols.insert(1, "date")
-    table = table.select(cols)
-
-    # Sort by mmsi then timestamp for fast seeking by vessel
-    table = table.sort_by([("mmsi", "ascending"), ("timestamp", "ascending")])
-
-    # Build per-MMSI daily index
-    index_table = _build_index(table, date_str)
-
-    # Attach GeoParquet metadata to schema
-    existing_meta = table.schema.metadata or {}
-    existing_meta[b"geo"] = json.dumps(_GEO_METADATA).encode()
-    table = table.replace_schema_metadata(existing_meta)
-
-    pq.write_table(table, out_path, compression="zstd")
-    pq.write_table(index_table, index_path, compression="zstd")
+    try:
+        n_rows, n_mmsi = _duckdb_pipeline(
+            csv_source, date_str, out_path, index_path,
+        )
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
     if delete_raw:
         raw_path.unlink()
         print(f"Deleted {raw_path.name}")
 
-    print(f"Wrote {out_path} ({table.num_rows:,} rows)")
-    print(f"Wrote {index_path} ({index_table.num_rows:,} MMSIs)")
+    print(f"Wrote {out_path} ({n_rows:,} rows)")
+    print(f"Wrote {index_path} ({n_mmsi:,} MMSIs)")
     return out_path, index_path
 
 
@@ -573,7 +334,7 @@ def convert_year(
 ) -> list[tuple[Path, Path]]:
     """Convert all raw files for a given year to Parquet.
 
-    Returns a list of (main_parquet_path, index_parquet_path) tuples.
+    Returns a list of (broadcast_parquet_path, index_parquet_path) tuples.
     When *workers* > 1, files are converted in parallel using a process pool.
     """
     raw_dir = data_dir / "raw" / str(year)
