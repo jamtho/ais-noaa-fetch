@@ -154,8 +154,8 @@ def _duckdb_pipeline(
             TRY_CAST({c('draft')} AS DOUBLE) AS draft,
             TRY_CAST({c('cargo')} AS INTEGER) AS cargo,
             {c('transceiver')} AS transceiver,
-            strptime({c('base_date_time')}, '%Y-%m-%d %H:%M:%S')
-                ::TIMESTAMPTZ AS timestamp,
+            strptime(REPLACE({c('base_date_time')}, 'T', ' '),
+                '%Y-%m-%d %H:%M:%S')::TIMESTAMPTZ AS timestamp,
             ST_Point(
                 TRY_CAST({c('longitude')} AS DOUBLE),
                 TRY_CAST({c('latitude')} AS DOUBLE)
