@@ -153,6 +153,25 @@ import geopandas as gpd
 gdf = gpd.read_parquet("data/parquet/broadcasts/2025/ais-2025-01-01.parquet")
 ```
 
+## Testing
+
+```bash
+uv run pytest
+```
+
+Tests use synthetic CSV data compressed to `.csv.zst`, run through the full conversion pipeline, and verify the output parquet files. All output is written to a temporary directory and cleaned up automatically. No network access or real NOAA data required.
+
+### What's covered
+
+- **Filename parsing** — date extraction from both `.zip` and `.csv.zst` naming conventions
+- **Broadcast schema** — column order, types (int32 mmsi, date32 date, string base_date_time, UTC timestamp, WKB geometry, uint64 h3), and sort order (mmsi, timestamp)
+- **Index schema** — column names, one row per MMSI, correct message counts, duration, and H3 cell counts
+- **GeoParquet metadata** — presence of `geo` metadata key in broadcast files
+- **Geospatial consistency** — centroid falls within bounding box, stationary vessels have ~0 distance, moving vessels have positive distance
+- **Cross-file consistency** — sum of index message counts equals broadcast row count
+- **Dirty data handling** — rows with invalid MMSI values (int32 overflow, letter prefixes, fractional floats) are dropped without failing the conversion
+- **Empty-list semantics** — identity list columns return `[]` rather than NULL when all values are absent
+
 ## Supported years
 
 - **2025+**: `.csv.zst` format
