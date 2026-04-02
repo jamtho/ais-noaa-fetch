@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# Secrets
+.env
+
 # Data files
 data/

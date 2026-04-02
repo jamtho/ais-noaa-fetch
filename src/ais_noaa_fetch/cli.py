@@ -80,6 +80,16 @@ def cmd_run(args: argparse.Namespace) -> None:
                 print(f"Failed to convert {raw_path.name}: {e}")
 
 
+def cmd_upload(args: argparse.Namespace) -> None:
+    """Handle the 'upload' subcommand."""
+    from ais_noaa_fetch.upload import upload_parquet
+
+    data_dir = resolve_data_dir(args)
+    print("Uploading parquet files to S3...")
+    uploaded = upload_parquet(data_dir, skip_existing=not args.force)
+    print(f"Uploaded {len(uploaded)} files.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     parser = argparse.ArgumentParser(
@@ -141,6 +151,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of parallel workers for conversion (default: 1)",
     )
     run_parser.set_defaults(func=cmd_run)
+
+    # --- upload ---
+    upload_parser = subparsers.add_parser(
+        "upload", help="Upload Parquet files to S3"
+    )
+    upload_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-upload files even if they already exist in S3",
+    )
+    upload_parser.set_defaults(func=cmd_upload)
 
     return parser
 
