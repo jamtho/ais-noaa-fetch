@@ -117,8 +117,10 @@ def _duckdb_pipeline(
 
     # Read CSV — all_varchar avoids type detection issues (e.g. base_date_time
     # auto-detected as TIMESTAMP in 2025+ files; we want it as VARCHAR).
+    # quote='' disables quoting — NOAA fields are never quoted, but vessel
+    # names contain apostrophes that confuse DuckDB's quote sniffer.
     con.execute(
-        f"CREATE VIEW raw AS SELECT * FROM read_csv('{csv_esc}', all_varchar=true)",
+        f"CREATE VIEW raw AS SELECT * FROM read_csv('{csv_esc}', all_varchar=true, quote='')",
     )
 
     # Detect old (MMSI, BaseDateTime, …) vs new (mmsi, base_date_time, …)
