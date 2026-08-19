@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import struct
+import zipfile
 from pathlib import Path
 
 import pyarrow as pa
@@ -38,13 +39,34 @@ MMSI,BaseDateTime,LAT,LON,SOG,COG,Heading,VesselName,IMO,CallSign,VesselType,Sta
 """
 
 
-def _make_zst(csv_text: str, tmp_path: Path, filename: str) -> Path:
+def _make_zst(
+    csv_text: str,
+    tmp_path: Path,
+    filename: str,
+    year: int = 2025,
+) -> Path:
     """Compress CSV text into a .csv.zst file inside a raw directory."""
-    raw_dir = tmp_path / "raw" / "2025"
+    raw_dir = tmp_path / "raw" / str(year)
     raw_dir.mkdir(parents=True, exist_ok=True)
     cctx = zstd.ZstdCompressor()
     path = raw_dir / filename
     path.write_bytes(cctx.compress(csv_text.encode()))
+    return path
+
+
+def _make_zip(
+    csv_text: str,
+    tmp_path: Path,
+    filename: str,
+    csv_filename: str,
+    year: int,
+) -> Path:
+    """Write CSV text into a .zip file inside a raw directory."""
+    raw_dir = tmp_path / "raw" / str(year)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    path = raw_dir / filename
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(csv_filename, csv_text)
     return path
 
 
@@ -135,6 +157,40 @@ class TestBroadcastParquet:
             "us", tz="UTC"
         )
 
+    def test_timestamp_values_are_utc(self, broadcast_table: pa.Table) -> None:
+        """NOAA timestamps are UTC, not process-local wall time."""
+        rows = broadcast_table.to_pylist()
+        row = next(r for r in rows if r["mmsi"] == 123456789)
+        assert row["timestamp"] == datetime.datetime(
+            2025, 1, 15, 10, 0, 0, tzinfo=datetime.UTC
+        )
+
+    def test_t_separator_is_normalized(self, tmp_path: Path) -> None:
+        """Older ZIP files use T; parquet normalizes to a space separator."""
+        csv = (
+            "MMSI,BaseDateTime,LAT,LON,SOG,COG,Heading,VesselName,"
+            "IMO,CallSign,VesselType,Status,Length,Width,Draft,Cargo,"
+            "TransceiverClass\n"
+            "123456789,2024-05-04T00:00:00,29.0,-90.0,5.0,180.0,180.0,"
+            "TEST,IMO1234567,WXY1234,70,0,100.0,20.0,5.0,70,A\n"
+        )
+        path = _make_zip(
+            csv,
+            tmp_path,
+            "AIS_2024_05_04.zip",
+            "AIS_2024_05_04.csv",
+            2024,
+        )
+        broadcast_path, _ = convert_file(path, tmp_path)
+        table = pq.read_table(broadcast_path)
+
+        assert table.column("base_date_time")[0].as_py() == (
+            "2024-05-04 00:00:00"
+        )
+        assert table.column("timestamp")[0].as_py() == datetime.datetime(
+            2024, 5, 4, 0, 0, 0, tzinfo=datetime.UTC
+        )
+
     def test_geometry_wkb_point(self, broadcast_table: pa.Table) -> None:
         assert broadcast_table.schema.field("geometry").type == pa.binary()
         wkb = broadcast_table.column("geometry")[0].as_py()
@@ -216,6 +272,34 @@ class TestIndexParquet:
         assert rows[987654321]["h3_cell_count"] == 1
         # Moving vessel should have > 1 (3 distinct points)
         assert rows[123456789]["h3_cell_count"] >= 1
+
+    def test_distance_uses_lat_lon_order(self, tmp_path: Path) -> None:
+        """Frozen longitude with latitude drift should count the full spread."""
+        header = (
+            "MMSI,BaseDateTime,LAT,LON,SOG,COG,Heading,VesselName,"
+            "IMO,CallSign,VesselType,Status,Length,Width,Draft,Cargo,"
+            "TransceiverClass"
+        )
+        rows: list[str] = []
+        for i in range(10):
+            lat = 10.0 + (i / 9.0)
+            rows.append(
+                "367416060,"
+                f"2025-05-22 00:{i:02d}:00,"
+                f"{lat:.6f},-90.398,0.0,0.0,0.0,HARVEY RAIN,"
+                "IMO9536210,WDG5515,70,5,64,17,3.0,70,A"
+            )
+        path = _make_zst(
+            "\n".join([header, *rows, ""]),
+            tmp_path,
+            "ais-2025-05-22.csv.zst",
+        )
+        _, index_path = convert_file(path, tmp_path)
+        row = pq.read_table(index_path).to_pylist()[0]
+
+        assert row["distance_m"] == pytest.approx(111_195.0, rel=0.01)
+        assert row["position_spread_m"] == pytest.approx(111_195.0, rel=0.01)
+        assert row["stationary_position_suspect"] is True
 
     def test_empty_list_not_null(self, index_table: pa.Table) -> None:
         """Identity list columns should be empty lists, not NULL."""

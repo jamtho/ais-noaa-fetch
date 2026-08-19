@@ -56,9 +56,9 @@ INDEX_COLUMNS = [
     "message_count", "first_timestamp", "last_timestamp", "duration_s",
     "centroid_lat", "centroid_lon",
     "min_lat", "max_lat", "min_lon", "max_lon",
-    "distance_m", "h3_cell_count",
+    "distance_m", "position_spread_m", "h3_cell_count",
     "sog_min", "sog_max", "sog_mean", "max_inter_msg_speed_ms",
-    "status_codes",
+    "stationary_position_suspect", "status_codes",
 ]
 
 
@@ -99,6 +99,11 @@ def _esc(path: str | Path) -> str:
     return str(path).replace("'", "''").replace("\\", "/")
 
 
+def _normalized_timestamp_expr(column_ref: str) -> str:
+    """Return SQL that normalizes NOAA timestamp strings to space-separated UTC."""
+    return f"REPLACE({column_ref}, 'T', ' ')"
+
+
 def _duckdb_pipeline(
     csv_source: str,
     date_str: str,
@@ -130,6 +135,8 @@ def _duckdb_pipeline(
     def c(name: str) -> str:
         return _col_ref(name, is_old)
 
+    base_date_time_expr = _normalized_timestamp_expr(c("base_date_time"))
+
     n_raw = con.execute("SELECT COUNT(*) FROM raw").fetchone()[0]
 
     # Build broadcast table: clean MMSI, cast types, derive columns, sort.
@@ -140,7 +147,7 @@ def _duckdb_pipeline(
         SELECT
             TRY_CAST({c('mmsi')} AS INTEGER) AS mmsi,
             '{date_str}'::DATE AS date,
-            {c('base_date_time')} AS base_date_time,
+            {base_date_time_expr} AS base_date_time,
             TRY_CAST({c('latitude')} AS DOUBLE) AS latitude,
             TRY_CAST({c('longitude')} AS DOUBLE) AS longitude,
             TRY_CAST({c('sog')} AS DOUBLE) AS sog,
@@ -156,8 +163,8 @@ def _duckdb_pipeline(
             TRY_CAST({c('draft')} AS DOUBLE) AS draft,
             TRY_CAST({c('cargo')} AS INTEGER) AS cargo,
             {c('transceiver')} AS transceiver,
-            strptime(REPLACE({c('base_date_time')}, 'T', ' '),
-                '%Y-%m-%d %H:%M:%S')::TIMESTAMPTZ AS timestamp,
+            strptime({base_date_time_expr}, '%Y-%m-%d %H:%M:%S')
+                AT TIME ZONE 'UTC' AS timestamp,
             ST_Point(
                 TRY_CAST({c('longitude')} AS DOUBLE),
                 TRY_CAST({c('latitude')} AS DOUBLE)
@@ -197,10 +204,13 @@ def _duckdb_pipeline(
             dists AS (
                 SELECT *,
                     CASE
-                        WHEN prev_lat IS NOT NULL AND latitude IS NOT NULL
+                        WHEN prev_lat IS NOT NULL
+                            AND prev_lon IS NOT NULL
+                            AND latitude IS NOT NULL
+                            AND longitude IS NOT NULL
                         THEN ST_Distance_Sphere(
-                                 ST_Point(longitude, latitude),
-                                 ST_Point(prev_lon, prev_lat))
+                                 ST_Point(latitude, longitude),
+                                 ST_Point(prev_lat, prev_lon))
                         ELSE 0.0
                     END AS dist_m,
                     CASE
@@ -209,59 +219,108 @@ def _duckdb_pipeline(
                         ELSE 0.0
                     END AS dt_s
                 FROM prev
+            ),
+            aggregated AS (
+                SELECT
+                    mmsi,
+                    '{date_str}'::DATE AS date,
+                    COALESCE(list(DISTINCT vessel_name ORDER BY vessel_name)
+                        FILTER (WHERE vessel_name IS NOT NULL),
+                        []::VARCHAR[]) AS vessel_names,
+                    COALESCE(list(DISTINCT imo ORDER BY imo)
+                        FILTER (WHERE imo IS NOT NULL),
+                        []::VARCHAR[]) AS imos,
+                    COALESCE(list(DISTINCT call_sign ORDER BY call_sign)
+                        FILTER (WHERE call_sign IS NOT NULL),
+                        []::VARCHAR[]) AS call_signs,
+                    COALESCE(list(DISTINCT vessel_type ORDER BY vessel_type)
+                        FILTER (WHERE vessel_type IS NOT NULL),
+                        []::INTEGER[]) AS vessel_types,
+                    COALESCE(list(DISTINCT cargo ORDER BY cargo)
+                        FILTER (WHERE cargo IS NOT NULL),
+                        []::INTEGER[]) AS cargos,
+                    COALESCE(list(DISTINCT length ORDER BY length)
+                        FILTER (WHERE length IS NOT NULL),
+                        []::DOUBLE[]) AS lengths,
+                    COALESCE(list(DISTINCT width ORDER BY width)
+                        FILTER (WHERE width IS NOT NULL),
+                        []::DOUBLE[]) AS widths,
+                    COALESCE(list(DISTINCT draft ORDER BY draft)
+                        FILTER (WHERE draft IS NOT NULL),
+                        []::DOUBLE[]) AS drafts,
+                    COALESCE(list(DISTINCT transceiver ORDER BY transceiver)
+                        FILTER (WHERE transceiver IS NOT NULL),
+                        []::VARCHAR[]) AS transceiver_classes,
+                    COUNT(*)::BIGINT AS message_count,
+                    MIN(timestamp) AS first_timestamp,
+                    MAX(timestamp) AS last_timestamp,
+                    EPOCH(MAX(timestamp) - MIN(timestamp)) AS duration_s,
+                    AVG(latitude) AS centroid_lat,
+                    AVG(longitude) AS centroid_lon,
+                    MIN(latitude) AS min_lat,
+                    MAX(latitude) AS max_lat,
+                    MIN(longitude) AS min_lon,
+                    MAX(longitude) AS max_lon,
+                    SUM(dist_m) AS distance_m,
+                    CASE
+                        WHEN MIN(latitude) IS NOT NULL
+                            AND MAX(latitude) IS NOT NULL
+                            AND MIN(longitude) IS NOT NULL
+                            AND MAX(longitude) IS NOT NULL
+                        THEN ST_Distance_Sphere(
+                                 ST_Point(MIN(latitude), MIN(longitude)),
+                                 ST_Point(MAX(latitude), MAX(longitude)))
+                        ELSE NULL
+                    END AS position_spread_m,
+                    COUNT(DISTINCT h3_res15)::BIGINT AS h3_cell_count,
+                    MIN(sog) AS sog_min,
+                    MAX(sog) AS sog_max,
+                    AVG(sog) AS sog_mean,
+                    MAX(CASE WHEN dt_s > 0 THEN dist_m / dt_s
+                        ELSE NULL END) AS max_inter_msg_speed_ms,
+                    COALESCE(list(DISTINCT status ORDER BY status)
+                        FILTER (WHERE status IS NOT NULL),
+                        []::INTEGER[]) AS status_codes
+                FROM dists
+                GROUP BY mmsi
             )
             SELECT
                 mmsi,
-                '{date_str}'::DATE AS date,
-                COALESCE(list(DISTINCT vessel_name ORDER BY vessel_name)
-                    FILTER (WHERE vessel_name IS NOT NULL),
-                    []::VARCHAR[]) AS vessel_names,
-                COALESCE(list(DISTINCT imo ORDER BY imo)
-                    FILTER (WHERE imo IS NOT NULL),
-                    []::VARCHAR[]) AS imos,
-                COALESCE(list(DISTINCT call_sign ORDER BY call_sign)
-                    FILTER (WHERE call_sign IS NOT NULL),
-                    []::VARCHAR[]) AS call_signs,
-                COALESCE(list(DISTINCT vessel_type ORDER BY vessel_type)
-                    FILTER (WHERE vessel_type IS NOT NULL),
-                    []::INTEGER[]) AS vessel_types,
-                COALESCE(list(DISTINCT cargo ORDER BY cargo)
-                    FILTER (WHERE cargo IS NOT NULL),
-                    []::INTEGER[]) AS cargos,
-                COALESCE(list(DISTINCT length ORDER BY length)
-                    FILTER (WHERE length IS NOT NULL),
-                    []::DOUBLE[]) AS lengths,
-                COALESCE(list(DISTINCT width ORDER BY width)
-                    FILTER (WHERE width IS NOT NULL),
-                    []::DOUBLE[]) AS widths,
-                COALESCE(list(DISTINCT draft ORDER BY draft)
-                    FILTER (WHERE draft IS NOT NULL),
-                    []::DOUBLE[]) AS drafts,
-                COALESCE(list(DISTINCT transceiver ORDER BY transceiver)
-                    FILTER (WHERE transceiver IS NOT NULL),
-                    []::VARCHAR[]) AS transceiver_classes,
-                COUNT(*)::BIGINT AS message_count,
-                MIN(timestamp) AS first_timestamp,
-                MAX(timestamp) AS last_timestamp,
-                EPOCH(MAX(timestamp) - MIN(timestamp)) AS duration_s,
-                AVG(latitude) AS centroid_lat,
-                AVG(longitude) AS centroid_lon,
-                MIN(latitude) AS min_lat,
-                MAX(latitude) AS max_lat,
-                MIN(longitude) AS min_lon,
-                MAX(longitude) AS max_lon,
-                SUM(dist_m) AS distance_m,
-                COUNT(DISTINCT h3_res15)::BIGINT AS h3_cell_count,
-                MIN(sog) AS sog_min,
-                MAX(sog) AS sog_max,
-                AVG(sog) AS sog_mean,
-                MAX(CASE WHEN dt_s > 0 THEN dist_m / dt_s
-                    ELSE NULL END) AS max_inter_msg_speed_ms,
-                COALESCE(list(DISTINCT status ORDER BY status)
-                    FILTER (WHERE status IS NOT NULL),
-                    []::INTEGER[]) AS status_codes
-            FROM dists
-            GROUP BY mmsi
+                date,
+                vessel_names,
+                imos,
+                call_signs,
+                vessel_types,
+                cargos,
+                lengths,
+                widths,
+                drafts,
+                transceiver_classes,
+                message_count,
+                first_timestamp,
+                last_timestamp,
+                duration_s,
+                centroid_lat,
+                centroid_lon,
+                min_lat,
+                max_lat,
+                min_lon,
+                max_lon,
+                distance_m,
+                position_spread_m,
+                h3_cell_count,
+                sog_min,
+                sog_max,
+                sog_mean,
+                max_inter_msg_speed_ms,
+                (
+                    message_count >= 10
+                    AND sog_max IS NOT NULL
+                    AND sog_max <= 0.5
+                    AND position_spread_m >= 1000.0
+                ) AS stationary_position_suspect,
+                status_codes
+            FROM aggregated
             ORDER BY mmsi
         ) TO '{_esc(index_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)

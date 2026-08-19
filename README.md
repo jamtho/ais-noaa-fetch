@@ -67,7 +67,7 @@ Each broadcast file contains 21 columns — 17 from the raw NOAA data plus 4 der
 |--------|------|-------------|
 | `mmsi` | int32 | Maritime Mobile Service Identity |
 | **`date`** | **date32** | **Derived — file date** |
-| `base_date_time` | string | Original timestamp string |
+| `base_date_time` | string | Original timestamp string normalized to `YYYY-MM-DD HH:MM:SS` |
 | `latitude` | float64 | Latitude |
 | `longitude` | float64 | Longitude |
 | `sog` | float64 | Speed Over Ground |
@@ -83,7 +83,7 @@ Each broadcast file contains 21 columns — 17 from the raw NOAA data plus 4 der
 | `draft` | float64 | Vessel draft |
 | `cargo` | int32 | Cargo type code |
 | `transceiver` | string | Transceiver class |
-| **`timestamp`** | **timestamp(us, UTC)** | **Derived — parsed from `base_date_time`** |
+| **`timestamp`** | **timestamp(us, UTC)** | **Derived — parsed from `base_date_time` as UTC** |
 | **`geometry`** | **binary (WKB)** | **Derived — WKB POINT from lon/lat** |
 | **`h3_res15`** | **uint64** | **Derived — H3 cell index at resolution 15** |
 
@@ -124,7 +124,8 @@ One row per MMSI per day. Enables fast lookups and filtering without scanning th
 | `centroid_lon` | float64 | Mean longitude |
 | `min_lat` / `max_lat` | float64 | Latitude bounding box |
 | `min_lon` / `max_lon` | float64 | Longitude bounding box |
-| `distance_m` | float64 | Sum of haversine distances between consecutive broadcasts (metres) |
+| `distance_m` | float64 | Sum of great-circle distances between consecutive broadcasts ordered by `timestamp` (metres) |
+| `position_spread_m` | float64 | Great-circle distance between opposing corners of the day's lat/lon bounding box (metres) |
 | `h3_cell_count` | int64 | Distinct H3 res-15 cells visited |
 
 ### Navigation
@@ -133,7 +134,19 @@ One row per MMSI per day. Enables fast lookups and filtering without scanning th
 |--------|------|-------------|
 | `sog_min` / `sog_max` / `sog_mean` | float64 | Speed Over Ground stats |
 | `max_inter_msg_speed_ms` | float64 | Max haversine distance / time delta between consecutive broadcasts (m/s) |
+| `stationary_position_suspect` | bool | True when a reported-stationary vessel-day has a large position spread |
 | `status_codes` | list\<int32\> | Distinct navigation status codes observed |
+
+`distance_m` and `max_inter_msg_speed_ms` are computed from every valid
+broadcast for the MMSI/day after sorting by `timestamp`; they are not filtered
+by reported SOG, status, duplicate position, or position-quality flags.
+Distances use DuckDB Spatial's `ST_Distance_Sphere` with latitude/longitude
+input order. The GeoParquet `geometry` column remains standard WKB POINT in
+longitude/latitude order.
+
+`stationary_position_suspect` is a coarse quality screen intended to catch
+smooth position-drift artefacts. It is true when `message_count >= 10`,
+`sog_max <= 0.5`, and `position_spread_m >= 1000`.
 
 ## GeoParquet
 
@@ -168,6 +181,8 @@ Tests use synthetic CSV data compressed to `.csv.zst`, run through the full conv
 - **Index schema** — column names, one row per MMSI, correct message counts, duration, and H3 cell counts
 - **GeoParquet metadata** — presence of `geo` metadata key in broadcast files
 - **Geospatial consistency** — centroid falls within bounding box, stationary vessels have ~0 distance, moving vessels have positive distance
+- **Time normalization** — `base_date_time` uses a space separator and `timestamp` preserves the source UTC instant regardless of process timezone
+- **Distance coordinate order** — latitude drift with frozen longitude contributes the expected great-circle distance
 - **Cross-file consistency** — sum of index message counts equals broadcast row count
 - **Dirty data handling** — rows with invalid MMSI values (int32 overflow, letter prefixes, fractional floats) are dropped without failing the conversion
 - **Empty-list semantics** — identity list columns return `[]` rather than NULL when all values are absent
